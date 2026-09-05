@@ -18,9 +18,11 @@ DEFAULT_WORK_DIR="/etc/"
 VIRTUAL_ROOT_CRONTAB="__ROOT_CRONTAB_EXPORT__"
 VIRTUAL_PMXCFS_SQL_DUMP="__PMXCFS_SQL_DUMP__"
 ALL_MARKER_PREFIX="__ALL__:"
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.1.0"
 UPSTREAM_SCRIPT_PAGE_URL="https://raw.githubusercontent.com/KrX3D/ProxmoxVE/refs/heads/main/tools/pve/host-backup.sh"
 DEFAULT_CRON_LOCAL_SCRIPT_PATH="/usr/local/sbin/pve-host-backup.sh"
+SELF_UPDATE_CONNECT_TIMEOUT="3"
+SELF_UPDATE_MAX_TIME="5"
 UI_H="22"
 UI_W="110"
 UI_MENU_H="10"
@@ -46,6 +48,12 @@ log()          { mkdir -p "$LOG_DIR"; echo "[$(ts)] $*" >> "$LOG_FILE"; }
 trim_quotes()  { local s="$1"; s="${s%\"}"; s="${s#\"}"; printf '%s' "$s"; }
 escape_squote(){ printf "%s" "$1" | sed "s/'/'\\''/g"; }
 
+# Succeeds (0) if dotted version $1 is strictly newer than $2.
+version_gt() {
+  [[ "$1" == "$2" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
 normalize_backup_path() {
   local path="${1:-$DEFAULT_BACKUP_PATH}"
   while [[ "$path" != "/" && "$path" == */ ]]; do path="${path%/}"; done
@@ -54,8 +62,46 @@ normalize_backup_path() {
 
 download_script_to_local() {
   mkdir -p "$(dirname "$2")" || return 1
-  curl -fsSL "$1" -o "$2"   || return 1
-  chmod +x "$2"
+  local tmp; tmp="$(mktemp)" || return 1
+  if curl -fsSL "$1" -o "$tmp" && chmod +x "$tmp"; then
+    mv -f "$tmp" "$2"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Self-update
+# ---------------------------------------------------------------------------
+# Checks the upstream script for a newer SCRIPT_VERSION and, if one is found,
+# replaces the local copy and re-execs into it so this run already uses it.
+# Any failure (offline, timeout, unreadable response, no version bump) is
+# silent and simply falls back to running the current local script.
+self_update() {
+  [[ -f "$SCRIPT_PATH" && -w "$SCRIPT_PATH" ]] || return 0
+
+  local remote_content
+  remote_content="$(curl -fsSL --connect-timeout "$SELF_UPDATE_CONNECT_TIMEOUT" --max-time "$SELF_UPDATE_MAX_TIME" "$UPSTREAM_SCRIPT_PAGE_URL" 2>/dev/null)" || return 0
+  [[ -n "$remote_content" ]] || return 0
+
+  local remote_version
+  remote_version="$(grep -m1 '^SCRIPT_VERSION=' <<<"$remote_content" | sed -E 's/^SCRIPT_VERSION="?([^"[:space:]]*)"?.*/\1/')"
+  [[ -n "$remote_version" ]] || return 0
+
+  version_gt "$remote_version" "$SCRIPT_VERSION" || return 0
+
+  local tmp_file
+  tmp_file="$(mktemp)" || return 0
+  printf '%s\n' "$remote_content" > "$tmp_file"
+
+  if bash -n "$tmp_file" 2>/dev/null && cp "$tmp_file" "$SCRIPT_PATH" 2>/dev/null; then
+    chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+    rm -f "$tmp_file"
+    log "Self-updated from v$SCRIPT_VERSION to v$remote_version ($SCRIPT_PATH)"
+    exec bash "$SCRIPT_PATH" "$@"
+  fi
+  rm -f "$tmp_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -451,8 +497,8 @@ build_run_command() {
       local_path=$(input_box "Install Path" "Enter the local path used by cron:" "$local_path") || return 1
       source_url="${source_url// /}"; local_path="${local_path// /}"
       [[ -n "$source_url" && -n "$local_path" ]] || return 1
-      printf "bash -lc 'curl -fsSL \"%s\" -o \"%s\" && chmod +x \"%s\" && \"%s\" --run-config' >/dev/null 2>&1" \
-        "$source_url" "$local_path" "$local_path" "$local_path"
+      printf "bash -lc 'tmp=\$(mktemp); if curl -fsSL \"%s\" -o \"\$tmp\" && chmod +x \"\$tmp\"; then mv -f \"\$tmp\" \"%s\"; else rm -f \"\$tmp\"; fi; \"%s\" --run-config' >/dev/null 2>&1" \
+        "$source_url" "$local_path" "$local_path"
       ;;
     *) log "Cron source mode invalid or cancelled"; return 1 ;;
   esac
@@ -735,6 +781,8 @@ $_cron_info"
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+self_update "$@"
+
 case "${1:-}" in
   --run-config) run_from_config ;;
   *)
