@@ -77,11 +77,19 @@ The backup summary and confirmation dialogs grow in height to fit all selected i
 
 ### Interactive mode
 
+Run directly from GitHub, no download step needed:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/KrX3D/ProxmoxVE/main/tools/pve/host-backup.sh)"
+```
+
+Or if you already have a local copy at some path:
+
 ```bash
 bash /path/to/host-backup.sh
 ```
 
-Or if installed locally:
+Or if installed locally at the default cron path:
 
 ```bash
 chmod +x /usr/local/sbin/pve-host-backup.sh
