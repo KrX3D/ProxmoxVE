@@ -18,7 +18,7 @@ DEFAULT_WORK_DIR="/etc/"
 VIRTUAL_ROOT_CRONTAB="__ROOT_CRONTAB_EXPORT__"
 VIRTUAL_PMXCFS_SQL_DUMP="__PMXCFS_SQL_DUMP__"
 ALL_MARKER_PREFIX="__ALL__:"
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 UPSTREAM_SCRIPT_PAGE_URL="https://raw.githubusercontent.com/KrX3D/ProxmoxVE/refs/heads/main/tools/pve/host-backup.sh"
 DEFAULT_CRON_LOCAL_SCRIPT_PATH="/usr/local/sbin/pve-host-backup.sh"
 UI_H="22"
@@ -144,9 +144,10 @@ select_items_interactive() {
     "${menu[@]}" 3>&1 1>&2 2>&3) || return 1
 
   selected_ref=()
+  local tags=()
+  eval "tags=($choice)"
   local token
-  for token in $choice; do
-    token="$(trim_quotes "$token")"
+  for token in "${tags[@]}"; do
     if [[ "$token" == "ALL" ]]; then
       selected_ref+=("${ALL_MARKER_PREFIX}${work_dir}")
       break
@@ -182,8 +183,10 @@ select_recommended_extras() {
     3>&1 1>&2 2>&3) || return 0
 
   extras_ref=()
+  local tags=()
+  eval "tags=($choice)"
   local token
-  for token in $choice; do extras_ref+=("$(trim_quotes "$token")"); done
+  for token in "${tags[@]}"; do extras_ref+=("$token"); done
 }
 
 parse_csv_paths() {
@@ -207,7 +210,7 @@ dedupe_items() {
 
   # First pass: record every directory covered by an ALL marker.
   for item in "${in_ref[@]}"; do
-    [[ "$item" == ${ALL_MARKER_PREFIX}* ]] && all_dirs["${item#${ALL_MARKER_PREFIX}}"]="1"
+    [[ "$item" == ${ALL_MARKER_PREFIX}* ]] && all_dirs["${item#"${ALL_MARKER_PREFIX}"}"]="1"
   done
 
   # Second pass: drop duplicates and plain paths subsumed by an ALL marker.
@@ -238,7 +241,7 @@ collect_backup_items() {
   local item dir p export_file dump_file
   for item in "${in_ref[@]}"; do
     if [[ "$item" == ${ALL_MARKER_PREFIX}* ]]; then
-      dir="${item#${ALL_MARKER_PREFIX}}"
+      dir="${item#"${ALL_MARKER_PREFIX}"}"
       shopt -s nullglob dotglob
       for p in "$dir"*; do [[ -e "$p" ]] && out_ref+=("$p"); done
       shopt -u nullglob dotglob
@@ -280,7 +283,7 @@ Selected items:"
     case "$item" in
       "$VIRTUAL_ROOT_CRONTAB")    summary+="\n - Export root crontab" ;;
       "$VIRTUAL_PMXCFS_SQL_DUMP") summary+="\n - Generate pmxcfs SQL dump" ;;
-      ${ALL_MARKER_PREFIX}*)      summary+="\n - ${item#${ALL_MARKER_PREFIX}} -> ALL" ;;
+      ${ALL_MARKER_PREFIX}*)      summary+="\n - ${item#"${ALL_MARKER_PREFIX}"} -> ALL" ;;
       *)                          summary+="\n - $item" ;;
     esac
   done
@@ -383,7 +386,8 @@ perform_backup() {
 # ---------------------------------------------------------------------------
 run_from_config() {
   load_config || { echo "No config file found at $CONFIG_FILE"; exit 1; }
-  local selected_items=("${SELECTED_ITEMS[@]:-}")
+  local selected_items=()
+  declare -p SELECTED_ITEMS &>/dev/null && selected_items=("${SELECTED_ITEMS[@]}")
   [[ ${#selected_items[@]} -gt 0 ]] || { echo "Config exists but has no selected items."; exit 1; }
   log "Loaded backup settings from config: $CONFIG_FILE"
   perform_backup \
@@ -415,7 +419,8 @@ build_run_command() {
 
   case "$choice" in
     1)
-      if [[ -f "$script_ref" && "$(basename "$script_ref")" == "host-backup.sh" ]]; then
+      local script_name; script_name="$(basename "$script_ref")"
+      if [[ -f "$script_ref" && ( "$script_name" == "host-backup.sh" || "$script_name" == "$(basename "$local_path")" ) ]]; then
         printf '%s' "$script_ref --run-config >/dev/null 2>&1"; return 0
       fi
       local_path=$(input_box "Local Script Path" \
@@ -570,7 +575,8 @@ main_interactive() {
     retention_days="${RETENTION_DAYS:-0}"
     include_log_in_archive="${INCLUDE_LOG_IN_ARCHIVE:-no}"
     copy_log_to_backup_path="${COPY_LOG_TO_BACKUP_PATH:-no}"
-    selected=("${SELECTED_ITEMS[@]:-}")
+    selected=()
+    declare -p SELECTED_ITEMS &>/dev/null && selected=("${SELECTED_ITEMS[@]}")
     local cleaned=(); dedupe_items selected cleaned; selected=("${cleaned[@]}")
 
     if yes_no "Existing Settings Found" \
