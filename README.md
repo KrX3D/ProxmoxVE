@@ -111,6 +111,25 @@ From the **Cron management** menu, option 4 ("Update local cron script from upst
 
 ---
 
+## Updating to a newer version
+
+The script's current version is shown in its title bar (e.g. `Proxmox VE Host Backup v1.0.2`) and on the **Show status and paths** screen, alongside the upstream URL it was published from. Compare that against the version at the top of [`tools/pve/host-backup.sh`](tools/pve/host-backup.sh) on GitHub (or check the [commit history](https://github.com/KrX3D/ProxmoxVE/commits/main/tools/pve/host-backup.sh)) to see if a newer copy is available.
+
+To pick up a newer version once one lands on `main`:
+
+- **From the script itself (recommended if you installed it for cron):** Main menu → **Cron management** → **Update local cron script from upstream**. This re-downloads the latest file to `/usr/local/sbin/pve-host-backup.sh` and makes it executable — safe to run any time, whether or not you actually use cron.
+- **Manually, for any install location:**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/KrX3D/ProxmoxVE/refs/heads/main/tools/pve/host-backup.sh -o /usr/local/sbin/pve-host-backup.sh
+  chmod +x /usr/local/sbin/pve-host-backup.sh
+  ```
+  Adjust the destination path if you installed it somewhere other than the default.
+- **Automatically on every cron run:** when setting up the cron job, choose script-source mode 3 ("Always update local file from URL before each cron run") instead of mode 1 or 2. This re-downloads before every scheduled run, so you always execute the latest version without a manual update step — at the cost of the run failing outright if the download fails (see the note under [Cron scheduling](#cron-scheduling)).
+
+Updating the script only replaces the script file itself. Your saved settings (`/etc/pve-host-backup/config.conf`) and any managed cron job are untouched and continue to work with the new version.
+
+---
+
 ## File locations
 
 | Path | Purpose |
