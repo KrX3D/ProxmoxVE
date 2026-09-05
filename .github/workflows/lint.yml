@@ -1,0 +1,40 @@
+name: Lint Shell Scripts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find shell scripts
+        id: files
+        run: |
+          shopt -s globstar nullglob
+          files=(**/*.sh)
+          echo "count=${#files[@]}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${files[@]}" > /tmp/shell-files.txt
+
+      - name: Bash syntax check
+        if: steps.files.outputs.count != '0'
+        run: |
+          while IFS= read -r f; do
+            echo "::group::bash -n $f"
+            bash -n "$f"
+            echo "::endgroup::"
+          done < /tmp/shell-files.txt
+
+      - name: ShellCheck (errors only, gating)
+        if: steps.files.outputs.count != '0'
+        run: |
+          xargs -a /tmp/shell-files.txt shellcheck --severity=error
+
+      - name: ShellCheck (full report, informational)
+        if: steps.files.outputs.count != '0'
+        continue-on-error: true
+        run: |
+          xargs -a /tmp/shell-files.txt shellcheck
