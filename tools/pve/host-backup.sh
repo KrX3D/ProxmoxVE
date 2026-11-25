@@ -13,12 +13,17 @@ CONFIG_FILE="$CONFIG_DIR/config.conf"
 LOG_DIR="/var/log/pve-host-backup"
 LOG_FILE="$LOG_DIR/backup.log"
 CRON_TAG="# PVE_HOST_BACKUP_MANAGED"
+# Cron output (tar errors, failure lines) goes to the log instead of /dev/null.
+CRON_REDIRECT=">> /var/log/pve-host-backup/backup.log 2>&1"
 DEFAULT_BACKUP_PATH="/root"
 DEFAULT_WORK_DIR="/etc/"
 VIRTUAL_ROOT_CRONTAB="__ROOT_CRONTAB_EXPORT__"
 VIRTUAL_PMXCFS_SQL_DUMP="__PMXCFS_SQL_DUMP__"
 ALL_MARKER_PREFIX="__ALL__:"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
+LOG_MAX_BYTES="$((1024 * 1024))"
+LOG_KEEP="5"
+NOTIFY_MAX_TIME="10"
 UPSTREAM_SCRIPT_PAGE_URL="https://raw.githubusercontent.com/KrX3D/ProxmoxVE/refs/heads/main/tools/pve/host-backup.sh"
 DEFAULT_CRON_LOCAL_SCRIPT_PATH="/usr/local/sbin/pve-host-backup.sh"
 SELF_UPDATE_CONNECT_TIMEOUT="3"
@@ -32,12 +37,25 @@ command -v tar      >/dev/null 2>&1 || { echo "tar is required.";          exit 
 command -v whiptail >/dev/null 2>&1 || { echo "whiptail is required.";     exit 1; }
 command -v crontab  >/dev/null 2>&1 || { echo "cron/crontab is required."; exit 1; }
 
-# Telemetry (non-fatal – silently ignored if unreachable)
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func) 2>/dev/null || true
-declare -f init_tool_telemetry &>/dev/null && init_tool_telemetry "host-backup" "pve"
-
 TMP_DIR=""
-cleanup() { [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+# Unattended (--run-config) state, used by the EXIT trap to send the
+# failure push when the run dies anywhere (including set -e aborts).
+UNATTENDED=false
+RUN_SUCCEEDED=false
+LAST_ERROR=""
+WARNINGS=()
+
+cleanup() {
+  local rc=$?
+  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+  if $UNATTENDED && ! $RUN_SUCCEEDED; then
+    local msg="${LAST_ERROR:-backup aborted (exit $rc)}"
+    log "Backup FAILED: $msg"
+    echo "pve-host-backup: FAILED: $msg" >&2
+    notify down "$msg"
+  fi
+  return 0
+}
 trap cleanup EXIT
 
 # Detect whether we have an interactive terminal (false when run from cron)
@@ -45,6 +63,8 @@ trap cleanup EXIT
 
 ts()           { date '+%Y-%m-%d %H:%M:%S'; }
 log()          { mkdir -p "$LOG_DIR"; echo "[$(ts)] $*" >> "$LOG_FILE"; }
+warn()         { WARNINGS+=("$*"); log "WARNING: $*"; }
+fail()         { LAST_ERROR="$*"; log "ERROR: $*"; }
 trim_quotes()  { local s="$1"; s="${s%\"}"; s="${s#\"}"; printf '%s' "$s"; }
 escape_squote(){ printf "%s" "$1" | sed "s/'/'\\''/g"; }
 
@@ -58,6 +78,65 @@ normalize_backup_path() {
   local path="${1:-$DEFAULT_BACKUP_PATH}"
   while [[ "$path" != "/" && "$path" == */ ]]; do path="${path%/}"; done
   printf '%s' "$path"
+}
+
+# Size-based rotation: backup.log -> backup.log.1 ... backup.log.$LOG_KEEP.
+rotate_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local size; size="$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)"
+  (( size > LOG_MAX_BYTES )) || return 0
+  local i
+  for (( i = LOG_KEEP - 1; i >= 1; i-- )); do
+    [[ -f "$LOG_FILE.$i" ]] && mv -f "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"
+  done
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+  log "Rotated log (previous log is $LOG_FILE.1)"
+}
+
+# Push to an Uptime Kuma push monitor (or any URL taking status/msg).
+# $1 = up|down, $2 = message. No-op when NOTIFY_URL is empty.
+notify() {
+  local url="${NOTIFY_URL:-}"
+  [[ -n "$url" ]] || return 0
+  command -v curl >/dev/null 2>&1 || { log "Notify skipped: curl missing"; return 0; }
+  # Kuma shows push URLs with a default "?status=up&msg=OK&ping=" query; drop it.
+  url="${url%%\?*}"
+  if ! curl -fsS -o /dev/null --max-time "$NOTIFY_MAX_TIME" -G \
+      --data-urlencode "status=$1" --data-urlencode "msg=$2" --data-urlencode "ping=" \
+      "$url" 2>>"$LOG_FILE"; then
+    log "Notify failed (status=$1)"
+  fi
+  return 0
+}
+
+# Refuses backup paths on a share that is not mounted, so a missing NFS/SMB
+# mount never makes mkdir -p silently fill the root disk.
+# REQUIRE_MOUNTPOINT: empty = auto (/mnt/pve/<id>, /mnt/<name>, /media/<name>),
+# "none" = no check, anything else = that path must be a mountpoint.
+check_backup_mount() {
+  local backup_path="$1" required="${REQUIRE_MOUNTPOINT:-}"
+  [[ "$required" == "none" ]] && return 0
+  if [[ -z "$required" ]]; then
+    case "$backup_path" in
+      /mnt/pve/?*) required="/mnt/pve/$(cut -d/ -f4 <<<"$backup_path")" ;;
+      /mnt/?*)     required="/mnt/$(cut -d/ -f3 <<<"$backup_path")" ;;
+      /media/?*)   required="/media/$(cut -d/ -f3 <<<"$backup_path")" ;;
+      *)           return 0 ;;
+    esac
+  fi
+  if ! mountpoint -q "$required" 2>/dev/null; then
+    fail "$required is not mounted (backup path $backup_path); refusing to write to the local disk"
+    return 1
+  fi
+}
+
+# gzip -t for .tar.gz, then a full tar listing for both formats.
+verify_archive() {
+  local file="$1"
+  if [[ "$file" == *.gz ]] && ! gzip -t "$file" 2>>"$LOG_FILE"; then
+    return 1
+  fi
+  tar -tPf "$file" >/dev/null 2>>"$LOG_FILE"
 }
 
 download_script_to_local() {
@@ -74,11 +153,14 @@ download_script_to_local() {
 # ---------------------------------------------------------------------------
 # Self-update
 # ---------------------------------------------------------------------------
-# Checks the upstream script for a newer SCRIPT_VERSION and, if one is found,
-# replaces the local copy and re-execs into it so this run already uses it.
-# Any failure (offline, timeout, unreadable response, no version bump) is
-# silent and simply falls back to running the current local script.
+# Opt-in only (AUTO_UPDATE='yes' in the config): this replaces a script that
+# runs as root with whatever is on the main branch, so it is off by default.
+# When enabled, checks the upstream script for a newer SCRIPT_VERSION and, if
+# one is found, replaces the local copy and re-execs into it so this run
+# already uses it. Any failure (offline, timeout, unreadable response, no
+# version bump) falls back to running the current local script.
 self_update() {
+  [[ "${AUTO_UPDATE:-no}" == "yes" ]] || return 0
   [[ -f "$SCRIPT_PATH" && -w "$SCRIPT_PATH" ]] || return 0
 
   local remote_content
@@ -104,7 +186,7 @@ self_update() {
   if bash -n "$tmp_file" 2>/dev/null; then
     chmod +x "$tmp_file"
     if mv -f "$tmp_file" "$SCRIPT_PATH" 2>/dev/null; then
-      log "Self-updated from v$SCRIPT_VERSION to v$remote_version ($SCRIPT_PATH)"
+      log "Self-updated from v$SCRIPT_VERSION to v$remote_version ($SCRIPT_PATH, sha256 $(sha256sum "$SCRIPT_PATH" | cut -d' ' -f1))"
       exec bash "$SCRIPT_PATH" "$@"
     fi
   fi
@@ -163,6 +245,14 @@ RETENTION_DAYS='$(escape_squote "$retention_days")'
 INCLUDE_LOG_IN_ARCHIVE='$(escape_squote "$include_log_in_archive")'
 COPY_LOG_TO_BACKUP_PATH='$(escape_squote "$copy_log_to_backup_path")'
 SELECTED_ITEMS=($list)
+# Uptime Kuma push URL for success/failure of unattended runs (empty = off)
+NOTIFY_URL='$(escape_squote "${NOTIFY_URL:-}")'
+# 'yes' = download and run newer versions from GitHub main automatically
+AUTO_UPDATE='$(escape_squote "${AUTO_UPDATE:-no}")'
+# Empty = auto-detect share mount under /mnt or /media, 'none' = no check, or a path
+REQUIRE_MOUNTPOINT='$(escape_squote "${REQUIRE_MOUNTPOINT:-}")'
+# 'no' = skip the pmxcfs SQL dump of /etc/pve (included by default)
+PMXCFS_SQL_DUMP='$(escape_squote "${PMXCFS_SQL_DUMP:-yes}")'
 EOF
   log "Saved config to $CONFIG_FILE"
 }
@@ -232,7 +322,7 @@ select_recommended_extras() {
     "/var/spool/cron/"               "Cron jobs (if you use cron heavily)"           "$cronspool_default" \
     "$VIRTUAL_ROOT_CRONTAB"          "Export root crontab to a file and include it"  "OFF" \
     "/var/lib/pve-cluster/config.db" "Raw pmxcfs backend database"                   "OFF" \
-    "$VIRTUAL_PMXCFS_SQL_DUMP"       "Safer pmxcfs SQL dump of /etc/pve backend"     "OFF" \
+    "$VIRTUAL_PMXCFS_SQL_DUMP"       "Safer pmxcfs SQL dump of /etc/pve backend"     "ON" \
     3>&1 1>&2 2>&3) || return 0
 
   extras_ref=()
@@ -303,12 +393,17 @@ collect_backup_items() {
       crontab -l > "$export_file" 2>/dev/null || true
       out_ref+=("$export_file")
     elif [[ "$item" == "$VIRTUAL_PMXCFS_SQL_DUMP" ]]; then
-      if command -v sqlite3 >/dev/null 2>&1 && [[ -f /var/lib/pve-cluster/config.db ]]; then
-        dump_file="$TMP_DIR/pve-cluster-config.sql"
-        sqlite3 /var/lib/pve-cluster/config.db .dump > "$dump_file"
-        out_ref+=("$dump_file")
+      if ! command -v sqlite3 >/dev/null 2>&1; then
+        warn "pmxcfs SQL dump skipped: sqlite3 missing (apt install sqlite3)"
+      elif [[ ! -f /var/lib/pve-cluster/config.db ]]; then
+        warn "pmxcfs SQL dump skipped: /var/lib/pve-cluster/config.db not found"
       else
-        log "Skipped pmxcfs SQL dump: sqlite3 missing or config.db not found"
+        dump_file="$TMP_DIR/pve-cluster-config.sql"
+        if sqlite3 /var/lib/pve-cluster/config.db .dump > "$dump_file" 2>>"$LOG_FILE"; then
+          out_ref+=("$dump_file")
+        else
+          warn "pmxcfs SQL dump failed (sqlite3 error, see log)"
+        fi
       fi
     elif [[ -e "$item" ]]; then
       out_ref+=("$item")
@@ -375,13 +470,22 @@ perform_backup() {
 
   backup_path="$(normalize_backup_path "$backup_path")"
 
+  # Must run before mkdir -p: an unmounted share would otherwise be recreated
+  # as a plain directory on the root disk and silently fill it.
+  if ! check_backup_mount "$backup_path"; then
+    msg_box "Backup Path Error" "$LAST_ERROR\n\nMount the share (or set REQUIRE_MOUNTPOINT in $CONFIG_FILE) and retry."
+    return 1
+  fi
+
   # Verify backup path is writable
   if ! mkdir -p "$backup_path" 2>/dev/null; then
+    fail "unable to create or access backup path $backup_path"
     msg_box "Backup Path Error" "Unable to create or access backup path:\n\n$backup_path"
     return 1
   fi
   local testfile="$backup_path/.pve-host-backup-write-test.$$"
   if ! : > "$testfile" 2>/dev/null; then
+    fail "backup path $backup_path is not writable"
     msg_box "Backup Path Error" \
       "Backup path is not writable/reachable:\n\n$backup_path\n\n(For network shares, verify mount/connectivity.)"
     return 1
@@ -393,6 +497,7 @@ perform_backup() {
   [[ "$include_log_in_archive" == "yes" && -f "$LOG_FILE" ]] && prepared+=("$LOG_FILE")
 
   if [[ ${#prepared[@]} -eq 0 ]]; then
+    fail "nothing to back up after filtering missing items"
     msg_box "Nothing to Backup" "After filtering missing/special items, nothing remained to back up."
     return 1
   fi
@@ -409,12 +514,25 @@ perform_backup() {
   $HAS_TTY && whiptail --backtitle "Proxmox VE Host Backup" --title "Backup Running" \
     --infobox "Creating backup archive...\n\nTarget:\n$backup_path" "$UI_H" "$UI_W" || true
 
-  if ! tar "${tar_opts[@]}" "$backup_path/$backup_file.$ext" --absolute-names "${prepared[@]}"; then
-    msg_box "Backup Failed" "Backup creation failed. Check reachability/space and log:\n\n$LOG_FILE"
-    log "Backup failed: $backup_path/$backup_file.$ext"
+  local archive="$backup_path/$backup_file.$ext" tar_rc=0
+  tar "${tar_opts[@]}" "$archive" --absolute-names "${prepared[@]}" 2>>"$LOG_FILE" || tar_rc=$?
+  # GNU tar: 1 = some files changed or vanished while being read (common for
+  # live /etc/pve, logs); the archive is still usable. 2+ = fatal.
+  if (( tar_rc == 1 )); then
+    warn "tar reported files changed while being archived (exit 1)"
+  elif (( tar_rc != 0 )); then
+    fail "tar failed with exit $tar_rc for $archive"
+    rm -f "$archive"
+    msg_box "Backup Failed" "Backup creation failed (tar exit $tar_rc). Check reachability/space and log:\n\n$LOG_FILE"
     return 1
   fi
-  log "Created backup: $backup_path/$backup_file.$ext"
+
+  if ! verify_archive "$archive"; then
+    fail "archive verification failed for $archive"
+    msg_box "Backup Failed" "The archive was written but failed verification:\n\n$archive\n\nSee log:\n$LOG_FILE"
+    return 1
+  fi
+  log "Created and verified backup: $archive ($(du -h "$archive" | cut -f1))"
 
   if [[ "$copy_log_to_backup_path" == "yes" && -f "$LOG_FILE" ]]; then
     cp -f "$LOG_FILE" "$backup_path/$backup_file.log" \
@@ -438,10 +556,17 @@ perform_backup() {
 # Run from saved config (used by cron via --run-config)
 # ---------------------------------------------------------------------------
 run_from_config() {
-  load_config || { echo "No config file found at $CONFIG_FILE"; exit 1; }
+  UNATTENDED=true
+  load_config || { fail "no config file found at $CONFIG_FILE"; exit 1; }
   local selected_items=()
   declare -p SELECTED_ITEMS &>/dev/null && selected_items=("${SELECTED_ITEMS[@]}")
-  [[ ${#selected_items[@]} -gt 0 ]] || { echo "Config exists but has no selected items."; exit 1; }
+  [[ ${#selected_items[@]} -gt 0 ]] || { fail "config has no selected items"; exit 1; }
+  # Configs saved before v1.2.0 have no PMXCFS_SQL_DUMP key: include it by default.
+  if [[ "${PMXCFS_SQL_DUMP:-yes}" != "no" ]]; then
+    local -a _deduped=()
+    selected_items+=("$VIRTUAL_PMXCFS_SQL_DUMP")
+    dedupe_items selected_items _deduped; selected_items=("${_deduped[@]}")
+  fi
   log "Loaded backup settings from config: $CONFIG_FILE"
   perform_backup \
     "${BACKUP_PATH:-$DEFAULT_BACKUP_PATH}" \
@@ -451,6 +576,16 @@ run_from_config() {
     "${INCLUDE_LOG_IN_ARCHIVE:-no}" \
     "${COPY_LOG_TO_BACKUP_PATH:-no}" \
     "${selected_items[@]}"
+  # Not reached on failure: set -e exits and the EXIT trap sends the failure push.
+
+  RUN_SUCCEEDED=true
+  local msg="OK"
+  if (( ${#WARNINGS[@]} > 0 )); then
+    msg="OK with warnings: $(printf '%s; ' "${WARNINGS[@]}")"
+    msg="${msg%; }"
+  fi
+  log "Backup finished: $msg"
+  notify up "$msg"
 }
 
 # ---------------------------------------------------------------------------
@@ -467,14 +602,13 @@ build_run_command() {
     --menu "Choose how cron should execute this script" "$UI_H" "$UI_W" 6 \
     "1" "Use local script path (if available)" \
     "2" "Download script once to local path and run local file" \
-    "3" "Always update local file from URL before each cron run" \
     3>&1 1>&2 2>&3) || { log "Cron source selection cancelled"; return 1; }
 
   case "$choice" in
     1)
       local script_name; script_name="$(basename "$script_ref")"
       if [[ -f "$script_ref" && ( "$script_name" == "host-backup.sh" || "$script_name" == "$(basename "$local_path")" ) ]]; then
-        printf '%s' "$script_ref --run-config >/dev/null 2>&1"; return 0
+        printf '%s' "$script_ref --run-config $CRON_REDIRECT"; return 0
       fi
       local_path=$(input_box "Local Script Path" \
         "No local script file detected for this run.\n\nEnter the full path to an already-installed copy of this script:" \
@@ -484,7 +618,7 @@ build_run_command() {
         msg_box "Cron Error" "The path does not exist:\n\n$local_path\n\nUse option 2 to download it first."
         log "Cron local path does not exist: $local_path"; return 1
       fi
-      printf '%s' "$local_path --run-config >/dev/null 2>&1"
+      printf '%s' "$local_path --run-config $CRON_REDIRECT"
       ;;
     2)
       source_url=$(input_box "Script URL"   "Enter the raw script URL."                "$source_url") || return 1
@@ -495,17 +629,7 @@ build_run_command() {
         msg_box "Cron Error" "Failed to download:\n$source_url\n\nto:\n$local_path"
         log "Cron download failed: source=$source_url target=$local_path"; return 1
       fi
-      printf '%s' "$local_path --run-config >/dev/null 2>&1"
-      ;;
-    3)
-      source_url=$(input_box "Script URL" \
-        "Enter script URL.\n\nCron will re-download and update the local file before each run." \
-        "$source_url") || return 1
-      local_path=$(input_box "Install Path" "Enter the local path used by cron:" "$local_path") || return 1
-      source_url="${source_url// /}"; local_path="${local_path// /}"
-      [[ -n "$source_url" && -n "$local_path" ]] || return 1
-      printf "bash -lc 'tmp=\$(mktemp \"%s.XXXXXX\"); if curl -fsSL \"%s\" -o \"\$tmp\" && chmod +x \"\$tmp\"; then mv -f \"\$tmp\" \"%s\"; else rm -f \"\$tmp\"; fi; \"%s\" --run-config' >/dev/null 2>&1" \
-        "$local_path" "$source_url" "$local_path" "$local_path"
+      printf '%s' "$local_path --run-config $CRON_REDIRECT"
       ;;
     *) log "Cron source mode invalid or cancelled"; return 1 ;;
   esac
@@ -716,6 +840,20 @@ main_interactive() {
 
   local deduped=(); dedupe_items selected deduped; selected=("${deduped[@]}")
 
+  # Globals: picked up by save_config and by notify().
+  NOTIFY_URL=$(input_box "Failure / Success Push" \
+    "Optional Uptime Kuma push URL (monitor type 'Push').\n\nScheduled runs report up on success and down on failure.\nLeave empty to disable." \
+    "${NOTIFY_URL:-}") || NOTIFY_URL="${NOTIFY_URL:-}"
+  NOTIFY_URL="${NOTIFY_URL// /}"
+
+  if whiptail --backtitle "Proxmox VE Helper Scripts" --title "Automatic Updates" --defaultno --yesno \
+    "Download and run newer versions of this script from GitHub (main branch) automatically on every run?\n\nThe script runs as root, so this is off by default. You can update manually from the Cron management menu." \
+    "$UI_H" "$UI_W"; then
+    AUTO_UPDATE="yes"
+  else
+    AUTO_UPDATE="no"
+  fi
+
   show_selected_summary "$backup_path" "$work_dir" "$compression" "$retention_days" \
     "$include_log_in_archive" "$copy_log_to_backup_path" "${selected[@]}"
 
@@ -788,6 +926,9 @@ $_cron_info"
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+rotate_log
+# Only for AUTO_UPDATE; each mode loads the config again itself.
+if [[ -f "$CONFIG_FILE" ]]; then load_config || true; fi
 self_update "$@"
 
 case "${1:-}" in

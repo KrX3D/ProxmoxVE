@@ -13,25 +13,34 @@ This adds feature-complete extension of the existing `tools/pve/host-backup.sh`.
 
 The original script (~90 lines) provides a simple interactive wizard: ask for a path, pick folders, run `tar`, done. Every setting is discarded after each run and there is no scheduling, retention, or extras support.
 
-The extended script retains the same core logic and all original features (including telemetry) and adds everything described below.
+The extended script retains the same core logic and all original features and adds everything described below. As of v1.2.0 the community-scripts telemetry hook (`api.func`) is removed: it sourced remote code as root on every run, including every cron run.
 
 ---
 
 ## New features
 
-### Automatic self-update
-On every run — interactive or `--run-config` — the script checks the version published at the upstream URL against its own. If the upstream copy is newer, it downloads it, replaces the currently running script file, and re-executes itself so that very run already uses the new version. If the check can't reach the network (offline, DNS failure, timeout) or the upstream copy isn't newer, it silently continues running the local copy — no error, no interruption. The check is bounded (3s to connect, 5s total) so a slow or dead network never stalls a run for long. This only applies when running from a real installed file the script can rewrite (e.g. `/usr/local/sbin/pve-host-backup.sh`); running via `bash <(curl ...)` has no persistent file to update, so the check is skipped.
+### Optional self-update (off by default)
+With `AUTO_UPDATE='yes'` in the config (asked by the wizard, default **No**), every run checks the upstream URL for a higher `SCRIPT_VERSION`, replaces the installed script and re-executes it. This runs whatever is on `main` as root, so it is opt-in; the sha256 of each installed update is logged. The check is bounded (3s connect, 5s total) and falls back to the local copy on any error.
+
+### Safety checks and verification (v1.2.0)
+- **Unmounted share guard:** if the backup path is under `/mnt/pve/<id>`, `/mnt/<name>` or `/media/<name>`, that directory must be a mountpoint, otherwise the run fails instead of `mkdir -p` filling the root disk. Override with `REQUIRE_MOUNTPOINT='/some/mount'` or disable with `REQUIRE_MOUNTPOINT='none'` in the config.
+- **Archive verification:** after `tar`, the archive is checked with `gzip -t` (for `.tar.gz`) and a full `tar -t` listing. A failed check fails the run.
+- **tar exit 1** (files changed while being read) is logged as a warning, not a failure; exit 2+ fails the run and removes the partial archive.
+- **Push notification:** set `NOTIFY_URL` (asked by the wizard) to an Uptime Kuma push URL. `--run-config` sends `status=up` (with any warnings in `msg`) on success and `status=down` with the error on any failure, including unexpected aborts.
+- **Log rotation:** `backup.log` is rotated at 1 MiB, keeping 5 old files (`backup.log.1` … `.5`).
+- **pmxcfs SQL dump on by default:** preselected in the wizard, and added to `--run-config` runs unless the config has `PMXCFS_SQL_DUMP='no'`. Needs `sqlite3` (`apt install sqlite3`); if it is missing the run succeeds with a warning.
 
 ### Persistent configuration
 At the end of the wizard, the script offers to save all settings to `/etc/pve-host-backup/config.conf`. On next launch, the script detects the saved config and offers to run immediately with those settings — no need to step through the wizard every time.
 
 ### Cron scheduling
-A managed cron job can be created, replaced, or removed from within the script. Three scheduling options are provided (daily, weekly, monthly) plus a custom cron expression input. Three script-source modes are available:
+A managed cron job can be created, replaced, or removed from within the script. Three scheduling options are provided (daily, weekly, monthly) plus a custom cron expression input. Two script-source modes are available:
 - **Local path** — use an already-installed copy of the script
 - **Download once** — fetch the script from the upstream URL, save it locally, then run the local file
-- **Always update** — re-download from the upstream URL before every cron run, then run the (possibly just-refreshed) local file either way. If the download fails, it simply runs the existing local copy instead of aborting the backup.
 
-Since the script now checks for updates itself on every run (see [Automatic self-update](#automatic-self-update) above), mode 3 is largely redundant with mode 1 — pick **Local path** unless you specifically want the pre-run refresh to happen as a separate step before the script even starts.
+The former "Always update before each cron run" mode was removed in v1.2.0 (it executed unverified code from GitHub as root on every run). Existing cron lines are not changed; re-create the cron job from the menu to switch.
+
+Cron output is appended to `/var/log/pve-host-backup/backup.log` instead of `/dev/null`. Cron jobs created before v1.2.0 still discard output; re-create them from the menu to pick this up.
 
 The managed cron entry is tagged with `# PVE_HOST_BACKUP_MANAGED` so it can be identified and updated without touching other cron jobs. Run `pve-host-backup.sh --run-config` to execute a non-interactive backup from cron using the saved config.
 
@@ -104,11 +113,12 @@ On first run the wizard steps through:
 5. **Item selection** — pick individual files/folders or select ALL for each working directory
 6. **Extras** — optional recommended Proxmox paths and virtual exports
 7. **Log options** — include log in archive and/or copy it next to the archive
-8. **Summary** — review all selections before the backup runs
-9. **Save settings** — optionally persist config for future runs and cron
-10. **Cron setup** — optionally create or update a scheduled job
+8. **Push URL / auto-update** — optional Uptime Kuma push URL, opt-in self-update
+9. **Summary** — review all selections before the backup runs
+10. **Save settings** — optionally persist config for future runs and cron
+11. **Cron setup** — optionally create or update a scheduled job
 
-On subsequent runs with a saved config, steps 1–10 are skipped and the script asks directly: *use saved settings?* → *confirm and run* → done.
+On subsequent runs with a saved config, steps 1–11 are skipped and the script asks directly: *use saved settings?* → *confirm and run* → done.
 
 ### Headless / cron mode
 
@@ -126,9 +136,7 @@ From the **Cron management** menu, option 4 ("Update local cron script from upst
 
 ## Updating to a newer version
 
-As of v1.1.0, **you normally don't need to do anything** — every run (interactive or `--run-config` from cron) checks the upstream URL for a newer version and, if one is found, downloads it, replaces the installed script file, and re-executes so that same run already uses it. If it can't reach the network, it just runs the local copy it already has, silently. See [Automatic self-update](#automatic-self-update) above for details.
-
-This only applies once the script is running from a real installed file. If you're on a version older than v1.1.0 (no self-update yet), or you're running via `bash <(curl ...)` with nothing installed locally, use one of these instead:
+Since v1.2.0 updates are manual unless you set `AUTO_UPDATE='yes'` (see [Optional self-update](#optional-self-update-off-by-default)). To update:
 
 - **From the script itself (recommended if you installed it for cron):** Main menu → **Cron management** → **Update local cron script from upstream**. This re-downloads the latest file to `/usr/local/sbin/pve-host-backup.sh` and makes it executable — safe to run any time, whether or not you actually use cron.
 - **Manually, for any install location:**
@@ -138,7 +146,7 @@ This only applies once the script is running from a real installed file. If you'
   ```
   Adjust the destination path if you installed it somewhere other than the default.
 
-The script's current version is shown in its title bar (e.g. `Proxmox VE Host Backup v1.1.0`) and on the **Show status and paths** screen, alongside the upstream URL it checks. Compare that against the version at the top of [`tools/pve/host-backup.sh`](tools/pve/host-backup.sh) on GitHub (or check the [commit history](https://github.com/KrX3D/ProxmoxVE/commits/main/tools/pve/host-backup.sh)) if you want to confirm a newer copy exists before it self-updates on its own.
+The script's current version is shown in its title bar (e.g. `Proxmox VE Host Backup v1.1.0`) and on the **Show status and paths** screen, alongside the upstream URL it checks. Compare that against the version at the top of [`tools/pve/host-backup.sh`](tools/pve/host-backup.sh) on GitHub (or check the [commit history](https://github.com/KrX3D/ProxmoxVE/commits/main/tools/pve/host-backup.sh)) if you want to confirm a newer copy exists.
 
 Updating the script — automatic or manual — only ever replaces the script file itself. Your saved settings (`/etc/pve-host-backup/config.conf`) and any managed cron job are untouched and continue to work with the new version.
 
